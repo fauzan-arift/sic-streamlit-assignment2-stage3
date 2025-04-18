@@ -1,0 +1,7 @@
+streamlit
+opencv-python-headless
+numpy
+requests
+paho-mqtt
+ultralytics
+google-generativeai
