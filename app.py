@@ -9,7 +9,7 @@ from ultralytics import YOLO
 import google.generativeai as genai  # Import Google's Generative AI library
 
 # === Konfigurasi Ubidots ===
-BIDOTS_TOKEN = st.secrets["UBIDOTS_TOKEN"]
+UBIDOTS_TOKEN = st.secrets["UBIDOTS_TOKEN"]
 DEVICE_LABEL = st.secrets["DEVICE_LABEL"]
 VARIABLE_CAMERA = st.secrets["VARIABLE_CAMERA"]
 VARIABLE_LIGHT = st.secrets["VARIABLE_LIGHT"]
