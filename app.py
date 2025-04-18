@@ -9,7 +9,7 @@ from ultralytics import YOLO
 import google.generativeai as genai  # Import Google's Generative AI library
 
 # === Konfigurasi Ubidots ===
-UBIDOTS_TOKEN = st.secrets["UBIDOTS_TOKEN"]
+BIDOTS_TOKEN = st.secrets["UBIDOTS_TOKEN"]
 DEVICE_LABEL = st.secrets["DEVICE_LABEL"]
 VARIABLE_CAMERA = st.secrets["VARIABLE_CAMERA"]
 VARIABLE_LIGHT = st.secrets["VARIABLE_LIGHT"]
@@ -242,16 +242,46 @@ def process_ai_command(response, user_input):
 
 
 # === Fungsi Streaming ESP32-CAM MJPEG ===
+def process_esp32_frame(frame, model):
+    """Process ESP32-CAM frame for human detection"""
+    try:
+        # Pre-process frame
+        frame = cv2.resize(frame, (416, 416))
+        
+        # Run detection
+        results = model.predict(
+            frame,
+            verbose=False,
+            conf=0.45,    # Lower confidence threshold for ESP32-CAM
+            iou=0.45,
+            agnostic_nms=True,
+            max_det=10    # Limit detections for performance
+        )
+        
+        # Get person detections only
+        boxes = results[0].boxes
+        people_boxes = [box for box in boxes if int(box.cls[0]) == 0 and float(box.conf[0]) > 0.45]
+        
+        return people_boxes, len(people_boxes)
+        
+    except Exception as e:
+        st.session_state.log.append(f"⚠️ Detection error: {str(e)}")
+        return [], 0
+
+
 def esp32_stream_generator(url):
+    """Generator untuk streaming ESP32-CAM dengan deteksi manusia."""
     st.session_state.log.append(f"🔄 Mencoba menghubungkan ke ESP32-CAM: {url}")
     
-    # Optimize connection settings
+    # Gunakan sesi HTTP untuk koneksi yang efisien dengan timeout yang tepat
     session = requests.Session()
     session.headers.update({
         'Connection': 'keep-alive',
         'Accept': 'multipart/x-mixed-replace; boundary=frame',
-        'Cache-Control': 'no-cache'
+        'Cache-Control': 'no-cache, no-store'
     })
+    
+    # Konfigurasi adapter dengan keepalive dan retry yang optimal
     adapter = requests.adapters.HTTPAdapter(
         pool_connections=1,
         pool_maxsize=1,
@@ -259,79 +289,141 @@ def esp32_stream_generator(url):
         pool_block=False
     )
     session.mount('http://', adapter)
-
+    
+    # Variabel untuk pembatasan rate frame
+    last_frame_time = time.time()
+    frame_rate_limit = 0.03  # ~30fps maksimum
+    
     try:
-        # Use a shorter timeout but not too short
-        stream = session.get(url, stream=True, timeout=2)
+        # Sambungkan ke stream dengan timeout yang tepat
+        stream = session.get(url, stream=True, timeout=(3, 2))  # (connect timeout, read timeout)
         
         if stream.status_code != 200:
             st.session_state.log.append(f"❌ Gagal koneksi: HTTP {stream.status_code}")
             yield None
             return
-
-        # Use a smaller initial buffer
-        byte_buffer = bytearray(8192)
-        last_frame_time = time.time()
-        frame_skip = 0
         
-        for chunk in stream.iter_content(chunk_size=4096):  # Smaller chunks
+        # Buffer dengan ukuran yang lebih besar untuk frame processing yang lebih efisien
+        byte_buffer = bytearray()
+        
+        # Konstanta untuk optimasi pencarian marker
+        jpeg_start = b'\xff\xd8'  # JPEG start marker
+        jpeg_end = b'\xff\xd9'    # JPEG end marker
+        
+        for chunk in stream.iter_content(chunk_size=8192):  # Buffer chunk yang lebih besar
             if not st.session_state.camera_on:
                 break
-
-            # Frame rate control - process every 3rd frame
-            frame_skip += 1
-            if frame_skip % 3 != 0:
-                continue
-
-            # Maintain smaller buffer
-            byte_buffer.extend(chunk)
-            if len(byte_buffer) > 32768:  # Clear buffer if too large
-                byte_buffer = byte_buffer[-16384:]
-
-            # Frame rate limiting
+                
+            # Rate limiting untuk mencegah overload
             current_time = time.time()
-            if current_time - last_frame_time < 0.033:  # ~30 FPS max
+            if current_time - last_frame_time < frame_rate_limit:
                 continue
-
-            # Process frame
-            start_marker = byte_buffer.find(b'\xff\xd8')
-            end_marker = byte_buffer.find(b'\xff\xd9')
+                
+            byte_buffer.extend(chunk)
             
-            if start_marker != -1 and end_marker != -1:
-                frame_data = byte_buffer[start_marker:end_marker + 2]
-                byte_buffer = byte_buffer[end_marker + 2:]  # Clear processed data
-
+            # Cari start marker dari posisi yang lebih efisien
+            start_pos = byte_buffer.find(jpeg_start)
+            
+            # Jika tidak ada start marker, kosongkan buffer untuk menghindari overhead
+            if start_pos == -1:
+                byte_buffer = bytearray()
+                continue
+                
+            # Hapus data sebelum marker awal untuk menghemat memori
+            if start_pos > 0:
+                byte_buffer = byte_buffer[start_pos:]
+                start_pos = 0
+                
+            # Cari end marker
+            end_pos = byte_buffer.find(jpeg_end, start_pos + 2)
+            
+            if end_pos != -1:
+                # Ekstrak frame lengkap
+                frame_data = bytes(byte_buffer[start_pos:end_pos + 2])
+                
+                # Reset buffer ke data setelah frame saat ini
+                byte_buffer = byte_buffer[end_pos + 2:]
+                
                 try:
-                    # Efficient image decoding
-                    frame = cv2.imdecode(
-                        np.frombuffer(frame_data, dtype=np.uint8),
-                        cv2.IMREAD_REDUCED_COLOR_2
-                    )
+                    # Decode frame dengan optimasi
+                    nparr = np.frombuffer(frame_data, np.uint8)
+                    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                     
                     if frame is not None:
-                        # Fast resize using INTER_NEAREST
-                        frame = cv2.resize(
-                            frame, 
-                            (640, 480),
-                            interpolation=cv2.INTER_NEAREST
-                        )
-                        
+                        # Update waktu frame terakhir untuk rate limiting
                         last_frame_time = current_time
+                        
+                        # Pre-resize frame untuk konsistensi dan performa
+                        if frame.shape[0] > 480 or frame.shape[1] > 640:
+                            frame = cv2.resize(frame, (640, 480), interpolation=cv2.INTER_AREA)
+                        
+                        # Process frame for detection
+                        detection_frame = frame.copy()
+                        people_boxes, count = process_esp32_frame(detection_frame, model)
+                        
+                        # Update state if count changed
+                        if count != st.session_state.count:
+                            st.session_state.count = count
+                            st.session_state.lamp = 1 if count > 0 else 0
+                            
+                            # Send to Ubidots less frequently
+                            current_time = time.time()
+                            if current_time - st.session_state.last_sent > 3.0:
+                                send_ubidots(VARIABLE_COUNT, count)
+                                send_ubidots(VARIABLE_LIGHT, st.session_state.lamp)
+                                st.session_state.last_sent = current_time
+                        
+                        # Draw detections on frame
+                        if count > 0:
+                            h, w = frame.shape[:2]
+                            h_ratio = h / 416
+                            w_ratio = w / 416
+                            
+                            for box in people_boxes:
+                                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                                x1, y1 = int(x1 * w_ratio), int(y1 * h_ratio)
+                                x2, y2 = int(x2 * w_ratio), int(y2 * h_ratio)
+                                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        
+                        # Add count overlay
+                        cv2.putText(frame, f"Jumlah Orang: {count}", 
+                                   (10, 15), cv2.FONT_HERSHEY_SIMPLEX, 
+                                   0.5, (255, 100, 100), 1.5)
+                        
                         yield frame
-                    
+                    else:
+                        # Jika frame rusak, lanjutkan ke frame berikutnya
+                        continue
                 except Exception as e:
                     st.session_state.log.append(f"⚠️ Frame error: {str(e)}")
+                    # Lanjutkan ke frame berikutnya daripada keluar
                     continue
-
+    
+    except requests.exceptions.ConnectTimeout:
+        st.session_state.log.append("❌ Timeout saat menghubungkan ke ESP32-CAM")
+        yield None
+    except requests.exceptions.ReadTimeout:
+        st.session_state.log.append("❌ Timeout saat membaca data dari ESP32-CAM")
+        yield None
+    except requests.exceptions.ConnectionError:
+        st.session_state.log.append("❌ Koneksi ke ESP32-CAM terputus")
+        yield None
     except Exception as e:
         st.session_state.log.append(f"❌ Error ESP32-CAM: {str(e)}")
         yield None
-
+    
     finally:
+        # Pastikan resource dibebaskan dengan baik
         if 'stream' in locals():
-            stream.close()
+            try:
+                stream.close()
+            except:
+                pass
         if 'session' in locals():
-            session.close()
+            try:
+                session.close()
+            except:
+                pass
 
 
 # === Format ESP32 URL ===
@@ -489,20 +581,22 @@ if stop:
 if st.session_state.camera_on:
     try:
         if st.session_state.camera_option == "ESP32-CAM":
-            # Ambil URL dari input
             url = st.session_state.esp32_url.strip()
-
             if not url:
                 st.error("⚠️ URL ESP32-CAM tidak boleh kosong!")
                 st.session_state.camera_on = False
             else:
-                # Format URL dengan benar
                 url = format_esp32_url(url)
-
-                st.session_state.log.append(f"📡 URL ESP32 final: {url}")
-
-                # Buat generator baru
-                frame_iterator = esp32_stream_generator(url)
+                for frame in esp32_stream_generator(url):
+                    if frame is not None:
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        frame_placeholder.image(frame_rgb, channels="RGB", use_container_width=True)
+                        
+                        # Update status
+                        status_placeholder.markdown(
+                            f"👥 **Jumlah Orang:** `{st.session_state.count}` &nbsp;&nbsp; "
+                            f"💡 **Lampu:** `{'ON' if st.session_state.lamp else 'OFF'}`"
+                        )
         else:
             # Optimize webcam capture
             cap = cv2.VideoCapture(0)
@@ -513,7 +607,6 @@ if st.session_state.camera_on:
 
         last_frame_time = time.time()
         frame_count = 0
-        no_new_frame_count = 0
         last_count = -1
         last_ubidots_send = time.time()
         skip_frames = 0  # Frame skip counter
@@ -525,52 +618,7 @@ if st.session_state.camera_on:
                 if skip_frames % 2 != 0:  # Process every other frame
                     continue
 
-                if st.session_state.camera_option == "ESP32-CAM":
-                    try:
-                        # Ambil frame berikutnya dari generator
-                        frame = next(frame_iterator)
-
-                        # Periksa jika frame valid
-                        if frame is None:
-                            no_new_frame_count += 1
-                            if no_new_frame_count > 10:
-                                st.error("⚠️ Tidak ada frame baru dari ESP32-CAM. Mencoba menghubungkan kembali...")
-                                st.session_state.log.append("🔄 Mencoba membuat koneksi baru ke ESP32-CAM")
-
-                                # Coba buat ulang generator
-                                frame_iterator = esp32_stream_generator(url)
-                                no_new_frame_count = 0
-                            time.sleep(0.5)
-                            continue
-
-                        no_new_frame_count = 0  # Reset counter jika frame diterima
-
-                    except StopIteration:
-                        st.error("⚠️ Stream ESP32-CAM berakhir. Mencoba menghubungkan kembali...")
-                        st.session_state.log.append("🔄 Mencoba membuat koneksi baru ke ESP32-CAM")
-
-                        # Buat generator stream baru
-                        frame_iterator = esp32_stream_generator(url)
-                        time.sleep(1)
-                        continue
-
-                    # Skip some frames to reduce load
-                    if frame_count % 3 != 0:  # Process every 3rd frame
-                        continue
-                        
-                    # Optimize frame for detection
-                    detection_frame = optimize_frame_for_detection(frame)
-                    
-                    # Run YOLO with optimized parameters
-                    results = model.predict(
-                        detection_frame,
-                        verbose=False,
-                        conf=0.45,  # Slightly lower threshold for ESP32-CAM
-                        iou=0.45,
-                        agnostic_nms=True,  # Better handling of small objects
-                        max_det=10  # Limit maximum detections
-                    )
-                else:
+                if st.session_state.camera_option != "ESP32-CAM":
                     ret, frame = cap.read()
                     if not ret:
                         continue
