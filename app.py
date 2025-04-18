@@ -384,7 +384,12 @@ def optimize_frame_for_detection(frame):
 
 
 # === UI ===
-st.title("🧠 Deteksi Orang Real-time dengan YOLOv8 + MQTT")
+st.title("🧠 AI Camera App to Control IoT Devices")
+st.write("Aplikasi ini menggunakan YOLOv8 untuk mendeteksi orang dan mengontrol perangkat IoT seperti kamera dan lampu.")
+st.warning(
+    "⚠️ Webcam lokal tidak dapat digunakan di Streamlit Cloud karena OpenCV `cv2.VideoCapture(0)` tidak didukung. "
+    "Harap gunakan ESP32-CAM atau perangkat kamera lain yang dapat diakses melalui jaringan."
+)
 
 # Create tabs for different functionality
 tab1, tab2 = st.tabs(["Kamera & Deteksi", "AI Assistant"])
